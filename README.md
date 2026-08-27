@@ -26,7 +26,7 @@
 |---|---|
 | 进程隐藏：随机英文字母名 exe | **已证实**：32KB 启动器 Glaclient.exe（`requireAdministrator`）将 `mfc101f.dll` 复制为随机名 EXE 执行；两者 SHA-256 完全一致（`b0520f94…`），伪装成 MFC101F.DLL（非微软真实模块名） |
 | 网卡限制：单网卡 | **已证实**：导入 IPHLPAPI（GetAdaptersInfo）+ `UsedMac`/`RealMac`/`ChoosedNetCard`，MAC 绑定校验 |
-| 动态认证：密钥每秒变化，无法模拟 | **已证伪**：认证为 `GET /cgi/client_check?...`（端口 3080 明文 HTTP），`&data=` 为 DES-ECB 密文，**密钥就是同一 URL 里明文传输的 `&time=HH:MM:SS` 参数**。抓包者可零成本实时解出用户名+密码明文——"每秒变密钥"不构成防护 |
+| 动态认证：密钥每秒变化，无法模拟 | **已证伪并实现替代客户端**：认证为 `GET /cgi/client_check?...`（端口 3080 明文 HTTP），`&data=` 为 DES-ECB 密文，**密钥就是同一 URL 里明文传输的 `&time=HH:MM:SS` 参数**。基于此已实现完整替代认证工具 `scripts/glaclient_reimpl.py`（见下文"替代认证客户端"） |
 | HTTP 协议（Wireshark 可见） | **已证实**：3080 端口明文 HTTP/1.0，完整请求格式已恢复（见报告第三节） |
 
 ## 关键发现速览
@@ -49,7 +49,8 @@
     ├── reports/README.md              # ★ 完整逆向报告（入口）
     ├── reports/vulnerability-report.md # 正式漏洞报告
     ├── reports/analysis-report.md     # 前期分析报告
-    ├── scripts/                       # 16 个分析/解密脚本（全部可运行）
+    ├── scripts/                       # 17 个分析/解密脚本（全部可运行）
+    │   ├── glaclient_reimpl.py        # ★★ 替代认证客户端（登录/保活/登出）
     │   ├── des_data_codec.py          # ★ &data= DES 编解码器（NBS KAT 验证）
     │   ├── keep_password_codec.py     # ★ KeepPassword 编解码器
     │   └── des_tables_check.py        # DES 8 表 FIPS 46 一致性验证
@@ -69,6 +70,29 @@ python3 cases/bcswkhd-audit/scripts/des_data_codec.py
 # 本地记住密码解密（config.ini -> 明文口令）
 python3 cases/bcswkhd-audit/scripts/keep_password_codec.py
 ```
+
+## 替代认证客户端（逆向 reimplementation）
+
+`scripts/glaclient_reimpl.py` 是基于上述逆向结果实现的**完整替代认证工具**，
+可脱离原客户端（无需管理员权限、无需伪装进程、任意网卡环境）完成 Portal 认证：
+
+```bash
+# 离线自检（验证 DES + 请求构建，不联网）
+python3 glaclient_reimpl.py --selftest
+
+# 登录
+python3 glaclient_reimpl.py --server 10.10.94.1 --un <用户名> --pwd <密码> login
+
+# 登录 + 自动保活（复刻原客户端状态机：连续 3 次无响应自动重认证）
+python3 glaclient_reimpl.py --server 10.10.94.1 --un <用户名> --pwd <密码> keepalive --interval 20
+
+# 登出
+python3 glaclient_reimpl.py --server 10.10.94.1 --un <用户名> --pwd <密码> logoff
+```
+
+与原客户端行为对照：明文结构 `ip|user|pwd|host|0|||MAC|11111111`（0x407310）、
+密钥 = `&time=` 同值（DES-ECB）、`mymethod` 三态路由、keepalive 失败重认证阈值
+（`over %d times unreceive data,reauth now`）均逐函数逆向恢复并通过 roundtrip 验证。
 
 ## 样本哈希
 
