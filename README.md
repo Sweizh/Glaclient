@@ -108,8 +108,15 @@ Windows 官方 Python 安装包自带 tkinter）：
 - **多网卡多账户并发认证**：每账号独立 `AuthSession` 线程同时登录/保活，
   会话面板实时显示各会话（账号/网卡/状态/最后活动），
   支持「全部登录 / 全部登出」
-- **虚拟网卡原理**：认证明文 `ip|user|pwd|host|0|||MAC|11111111` 中的
-  ip/host/MAC 全部替换为虚拟身份——绕开原客户端"单网卡"限制
+- **两种虚拟网卡模式**：
+  - **明文模式**（免权限，协议研究用）：认证明文中的 ip/host/MAC
+    替换为虚拟身份，但数据包源 IP 仍是物理网卡主 IP
+  - **OS 插卡模式**（需管理员/root，等效插实体物联网卡）：经
+    `VirtualNicManager` 在操作系统层创建**真实接口**——Linux 用
+    `macvlan`（独立接口+独立 MAC，与插一张实体卡无异），Windows 用
+    `netsh` 给物理网卡加 IP 别名（网关看到独立 ARP 条目），macOS 用
+    `ifconfig alias`；每个会话 socket **bind 到各自虚拟 IP** 发包，
+    **网关看到的源 IP/MAC 就是虚拟身份**；退出自动删除接口
 - **复刻原客户端状态机**：连续 3 次无响应自动重认证，线程运行不卡界面
 - **跨平台环境采集**：Linux 读 `/sys/class/net`，Windows/macOS 走 `uuid.getnode()`
 - **实时日志**：每次请求的时间密钥、响应判定结果全可见
@@ -119,10 +126,21 @@ Windows 官方 Python 安装包自带 tkinter）：
 ```bash
 python3 scripts/glaclient_ui.py     # Windows: python glaclient_ui.py
 
-# CLI 多账号并发模式（同一 accounts.json，未绑定账号自动生成虚拟网卡）
+# CLI 多账号并发（明文虚拟网卡模式）
 python3 scripts/glaclient_reimpl.py --multi scripts/accounts.json \
     --vnic-ip-prefix 10.10.94 --vnic-start 100
+
+# CLI 多账号并发（OS 插卡模式：数据包源 IP = 虚拟 IP，需管理员/root）
+# Windows（管理员）：netsh IP 别名；Linux（sudo）：macvlan 独立 MAC
+python3 scripts/glaclient_reimpl.py --multi scripts/accounts.json --real-vnic
+sudo  python3 scripts/glaclient_reimpl.py --multi scripts/accounts.json --real-vnic
 ```
+
+> 插卡模式说明：Linux macvlan 创建的接口拥有独立 MAC+IP，网关完全将其
+> 视为一台独立设备（与插实体物联网卡等效）；Windows 为物理网卡 IP 别名
+> （网关见独立 ARP 条目，源 MAC 为物理网卡——Windows 单网卡多 MAC 需
+> NDIS 驱动级方案）。沙盒验证：bind 源 IP 经服务器侧 `getpeername()`
+> 实测确认生效；macvlan/netsh/ifconfig 命令三平台逐一验证。
 
 ## 样本哈希
 

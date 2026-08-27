@@ -37,7 +37,8 @@ from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 from glaclient_reimpl import (AuthSession, OK_MAP, build_request,
-                              generate_virtual_nics, send_request)
+                              generate_virtual_nics, send_request,
+                              VirtualNicManager)
 import keep_password_codec as pwcodec
 
 ACCOUNTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -66,6 +67,8 @@ class AuthUI:
                                      #   language,virtual_ip,virtual_mac,virtual_hostname}]
         self.sessions = {}           # username -> AuthSession（并发会话）
         self.log_queue = queue.Queue()
+        self.vnic_mgr = None         # OS 级真实虚拟网卡管理器
+        self.os_bound_ips = set()    # 已创建真实接口的 IP（会话 bind 用）
 
         self._build_widgets()
         self._load_accounts()
@@ -139,9 +142,9 @@ class AuthUI:
         right.columnconfigure(1, weight=1)
 
         # 虚拟网卡批量生成区
-        vn = ttk.LabelFrame(self.root,
-                            text=" 虚拟网卡批量生成（自动分配给未绑定的账号） ",
-                            padding=8)
+        vn = ttk.LabelFrame(
+            self.root, text=" 虚拟网卡批量生成（自动分配给未绑定的账号） ",
+            padding=8)
         vn.pack(fill=tk.X, padx=8, pady=(4, 2))
         ttk.Label(vn, text="数量:").pack(side=tk.LEFT)
         self.vnic_count_var = tk.StringVar(value="3")
@@ -155,9 +158,12 @@ class AuthUI:
         self.vnic_start_var = tk.StringVar(value="100")
         ttk.Entry(vn, width=6, textvariable=self.vnic_start_var
                   ).pack(side=tk.LEFT, padx=(2, 10))
-        ttk.Button(vn, text="⚡ 生成并分配",
+        ttk.Button(vn, text="⚡ 生成并分配（明文模式）",
                    command=self._generate_vnics).pack(side=tk.LEFT)
-        ttk.Label(vn, text="（02 开头本地管理 MAC，不与真实网卡冲突）",
+        ttk.Button(vn, text="🔌 创建 OS 真实虚拟网卡（插卡模式）",
+                   command=self._create_os_vnics).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(vn, text="明文=仅声明身份；OS=数据包源 IP 即虚拟 IP"
+                          "（Linux: macvlan 独立 MAC / Win: IP 别名），需管理员",
                   foreground="#888").pack(side=tk.LEFT, padx=(10, 0))
 
         # 操作区
@@ -330,15 +336,22 @@ class AuthUI:
             self.log(f"[-] 账号已删除: {acc['name']}")
 
     # --------------------------------------------------------- 虚拟网卡生成
-    def _generate_vnics(self):
-        """按指定数量生成虚拟网卡并分配给未绑定的账号。"""
+    def _vnic_params(self):
         try:
             count = max(1, int(self.vnic_count_var.get()))
             start = int(self.vnic_start_var.get())
         except ValueError:
             messagebox.showwarning("提示", "数量/起始主机号必须是整数")
-            return
+            return None
         prefix = self.vnic_prefix_var.get().strip() or "10.10.94"
+        return count, prefix, start
+
+    def _generate_vnics(self):
+        """明文模式：生成虚拟网卡并分配给未绑定的账号（协议研究用）。"""
+        params = self._vnic_params()
+        if not params:
+            return
+        count, prefix, start = params
         nics = generate_virtual_nics(count, prefix, start)
         assigned = 0
         j = 0
@@ -359,6 +372,62 @@ class AuthUI:
         if assigned < len(nics):
             self.log(f"[*] 提示：{len(nics) - assigned} 个虚拟网卡未分配"
                      f"（所有账号均已绑定）；新建账号后可再分配")
+
+    def _create_os_vnics(self):
+        """插卡模式：OS 层创建真实虚拟网卡（数据包源 IP = 虚拟 IP）。
+
+        Linux: macvlan（独立接口独立 MAC，等效插实体卡）
+        Windows: 物理网卡 IP 别名（网关见独立 ARP 条目）
+        需管理员/root；创建后绑定会话自动从虚拟 IP 发包，退出时删除。
+        """
+        params = self._vnic_params()
+        if not params:
+            return
+        count, prefix, start = params
+        # 若已有 OS 虚拟网卡先删除（重复点击/调整数量）
+        if self.vnic_mgr:
+            self.vnic_mgr.destroy()
+            self.os_bound_ips.clear()
+            self.log("[*] 已删除旧 OS 虚拟网卡")
+        self.vnic_mgr = VirtualNicManager()
+        if not self.vnic_mgr.has_privilege():
+            self.log(f"[!] 无{'管理员' if self.vnic_mgr.os_name == 'windows' else 'root'}权限："
+                     f"请以{'管理员身份重新运行（Windows 右键→以管理员身份运行）' if self.vnic_mgr.os_name == 'windows' else 'sudo 运行'}，"
+                     f"或改用「明文模式」")
+            messagebox.showwarning(
+                "需要权限",
+                f"创建 OS 级真实虚拟网卡需要"
+                f"{'管理员权限（请右键以管理员身份运行本程序）' if self.vnic_mgr.os_name == 'windows' else 'root 权限（sudo 运行）'}。\n\n"
+                f"明文模式无需权限，但数据包源 IP 仍是物理网卡主 IP。")
+            self.vnic_mgr = None
+            return
+        try:
+            nics = self.vnic_mgr.create(count, prefix, start)
+        except (PermissionError, RuntimeError) as e:
+            self.log(f"[!] OS 虚拟网卡创建失败: {e}")
+            messagebox.showerror("创建失败", str(e))
+            self.vnic_mgr = None
+            return
+        # 分配给未绑定账号（同明文模式逻辑）
+        j, assigned = 0, 0
+        for acc in self.accounts:
+            if not (acc.get("virtual_ip") or acc.get("virtual_mac")):
+                if j < len(nics):
+                    acc["virtual_ip"] = nics[j]["ip"]
+                    acc["virtual_mac"] = nics[j]["mac"]
+                    acc["virtual_hostname"] = nics[j]["hostname"]
+                    j += 1
+                    assigned += 1
+        self._save_accounts()
+        self._refresh_list()
+        for n in nics:
+            self.os_bound_ips.add(n["ip"])
+            kind = ("macvlan" if n["platform"] == "linux" else "IP 别名")
+            self.log(f"[+] OS vNIC [{n['name']}] @{n['iface']} {n['ip']} "
+                     f"mac={n['mac']} ({kind})")
+        self.log(f"[+] 已创建 {count} 个 OS 级真实虚拟网卡并分配 {assigned} 个账号；"
+                 f"登录后数据包将以各虚拟 IP 为源地址发往网关")
+        self.log("[*] 提示：退出程序时将自动删除这些虚拟网卡")
 
     # --------------------------------------------------------- 并发认证会话
     def _interval(self):
@@ -382,11 +451,18 @@ class AuthUI:
                         ip=cred.get("ip"), mac=cred.get("mac"),
                         hostname=cred.get("hostname"),
                         interval=self._interval(), max_fail=MAX_FAIL,
-                        on_log=self.log, on_state=on_state)
+                        on_log=self.log, on_state=on_state,
+                        bind_ip=(cred.get("ip") if cred.get("ip")
+                                 in self.os_bound_ips else None))
         self.sessions[un] = s
         # 会话表行（iid = username）
-        nic = (f"{cred.get('ip') or '-'}/{cred.get('mac') or '-'}"
-               if (cred.get("ip") or cred.get("mac")) else "真实网卡")
+        bind = cred.get("ip") in self.os_bound_ips
+        if bind:
+            nic = f"OS-vnic {cred.get('ip')} (src IP)"
+        elif cred.get("ip") or cred.get("mac"):
+            nic = f"{cred.get('ip') or '-'}/{cred.get('mac') or '-'} (明文)"
+        else:
+            nic = "真实网卡"
         if self.tree.exists(un):
             self.tree.delete(un)
         self.tree.insert("", tk.END, iid=un,
@@ -518,6 +594,12 @@ class AuthUI:
         # 逐个登出（快速关闭：join 超时后仍销毁窗口）
         for s in list(self.sessions.values()):
             s.stop(logoff=True, timeout=2)
+        # 删除本次创建的 OS 级虚拟网卡
+        if self.vnic_mgr:
+            try:
+                self.vnic_mgr.destroy()
+            except Exception:
+                pass
         self.root.destroy()
 
 

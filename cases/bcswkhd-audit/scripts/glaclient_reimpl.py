@@ -27,6 +27,7 @@ glaclient_reimpl.py — 冰川上网客户端（Glaclient v4.12）替代认证�
 """
 import argparse
 import json
+import os
 import socket
 import sys
 import threading
@@ -230,9 +231,20 @@ OK_MAP = {
     "logoff":    "logoff_ok",
 }
 
-def send_request(server_ip, req, timeout=8):
-    s = socket.create_connection((server_ip, 3080), timeout=timeout)
+def send_request(server_ip, req, timeout=8, bind_ip=None, port=3080):
+    """发送认证请求。
+
+    bind_ip：OS 级虚拟网卡的 IP——先 bind 再 connect，数据包的
+    源 IP 即虚拟 IP（网关看到的就是虚拟身份，等效插了一张实体卡）；
+    None 则用系统默认路由出口（物理网卡主 IP）。
+    port：认证网关端口（默认 3080）。
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
+        if bind_ip:
+            s.bind((bind_ip, 0))  # 源地址绑定（需该 IP 已配置在本机）
+        s.settimeout(timeout)
+        s.connect((server_ip, port))
         s.sendall(req.encode("ascii"))
         chunks = []
         while True:
@@ -307,6 +319,191 @@ def generate_virtual_nics(count, ip_prefix="10.10.94", start=100):
     return nics
 
 # ---------------------------------------------------------------------------
+# OS 级虚拟网卡管理（真实接口：数据包源 IP/MAC 即虚拟身份）
+# ---------------------------------------------------------------------------
+class VirtualNicManager:
+    """在操作系统层创建真实虚拟网卡——效果等同于插实体物联网卡到网关。
+
+    与 generate_virtual_nics()（仅明文声明身份）不同：本类创建的接口
+    真实存在于 OS 协议栈，socket bind 到虚拟 IP 后，发往网关的数据包
+    源地址就是虚拟 IP/MAC，网关按独立设备对待。
+
+    平台实现：
+        Linux   : macvlan（物理网卡上桥接出独立接口）——独立 MAC + 独立 IP，
+                  完全等效插了一张实体卡。需 root。
+        Windows : netsh 给物理网卡加 IP 别名——网关看到独立 ARP 条目，
+                  等效 IP 层插卡（源 MAC 为物理网卡）。需管理员。
+        macOS   : ifconfig alias（IP 别名）。需 root。
+
+    用法：
+        mgr = VirtualNicManager()
+        nics = mgr.create(3)          # 创建 3 个真实虚拟网卡
+        try:
+            ...每个会话 send_request(..., bind_ip=nic["ip"])
+        finally:
+            mgr.destroy()             # 删除全部本次创建的接口
+    """
+
+    def __init__(self, iface=None, mask="255.255.255.0", prefix_len=24):
+        self.iface = iface          # 物理网卡名；None = 默认路由网卡
+        self.mask = mask
+        self.prefix_len = prefix_len
+        self.nics = []              # 本次创建（destroy 用）
+        self.os_name = ("windows" if os.name == "nt"
+                        else "darwin" if sys.platform == "darwin" else "linux")
+
+    # ------------------------------------------------------------ 权限/网卡
+    def has_privilege(self):
+        try:
+            if self.os_name == "windows":
+                import ctypes
+                return ctypes.windll.shell32.IsUserAnAdmin() != 0
+            return os.geteuid() == 0
+        except Exception:
+            return False
+
+    def _default_iface(self):
+        """默认路由物理网卡名（出错返回 None）。"""
+        if self.os_name == "linux":
+            try:
+                with open("/proc/net/route") as f:
+                    for l in f.read().splitlines()[1:]:
+                        p = l.split()
+                        if p[1] == "00000000":
+                            return p[0]
+            except OSError:
+                pass
+            return None
+        if self.os_name == "windows":
+            out = self._run(["powershell", "-NoProfile", "-Command",
+                             "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' "
+                             "| Select-Object -First 1).InterfaceAlias"])
+            return out.strip() if out else None
+        out = self._run(["route", "-n", "get", "default"])
+        if out:
+            for l in out.splitlines():
+                if "interface:" in l.lower():
+                    return l.split(":", 1)[1].strip()
+        return None
+
+    def _phys_mac(self):
+        """物理网卡 MAC（Windows/macOS 别名模式的明文 MAC）。"""
+        if self.os_name == "linux":
+            try:
+                with open(f"/sys/class/net/{self.iface}/address") as f:
+                    return f.read().strip().upper().replace(":", "")
+            except OSError:
+                pass
+        elif self.os_name == "windows":
+            out = self._run(["powershell", "-NoProfile", "-Command",
+                             f"(Get-NetAdapter -Name '{self.iface}' "
+                             f"-ErrorAction SilentlyContinue).MacAddress"])
+            if out and out.strip():
+                return out.strip().replace("-", "").replace(":", "").upper()
+        else:
+            out = self._run(["ifconfig", self.iface])
+            if out:
+                for l in out.splitlines():
+                    if "ether" in l:
+                        return l.split()[1].replace(":", "").upper()
+        return None
+
+    def _run(self, cmd):
+        """执行命令，返回 stdout（失败返回 ''）。"""
+        import subprocess
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            return r.stdout if r.returncode == 0 else ""
+        except (OSError, subprocess.SubprocessError):
+            return ""
+
+    # ------------------------------------------------------------ 创建/删除
+    def _plan(self, count, ip_prefix, start):
+        """生成 nics + 每个网卡要执行的命令列表（不执行，可测试）。"""
+        iface = self.iface or self._default_iface()
+        if not iface:
+            raise RuntimeError("未能定位物理网卡（默认路由不存在？）")
+        self.iface = iface
+        phys_mac = self._phys_mac()
+        plans = []
+        for i in range(count):
+            ip = f"{ip_prefix}.{start + i}"
+            vname = f"gla_vnic{i + 1}"
+            mac = "02" + "".join("%02X" % __import__("random").randrange(256)
+                                 for _ in range(5))
+            if self.os_name == "linux":
+                # macvlan：独立接口，独立 MAC
+                cmds = [
+                    ["ip", "link", "add", "link", iface, vname,
+                     "type", "macvlan", "mode", "bridge"],
+                    ["ip", "link", "set", "dev", vname, "address", mac],
+                    ["ip", "link", "set", "dev", vname, "up"],
+                    ["ip", "addr", "add", f"{ip}/{self.prefix_len}", "dev", vname],
+                ]
+                use_mac = mac
+            elif self.os_name == "windows":
+                # netsh IP 别名：同物理网卡多 IP
+                cmds = [["netsh", "interface", "ipv4", "add", "address",
+                         f"name=\"{iface}\"", ip, self.mask]]
+                use_mac = phys_mac
+            else:  # darwin
+                cmds = [["ifconfig", iface, "alias", ip,
+                         "netmask", self.mask]]
+                use_mac = phys_mac
+            plans.append({
+                "name": vname, "ip": ip, "mac": use_mac or mac,
+                "hostname": f"GLA-VNIC-{i + 1:02d}",
+                "cmds": cmds, "iface": iface,
+            })
+        return plans
+
+    def create(self, count, ip_prefix="10.10.94", start=100):
+        """创建 count 个真实虚拟网卡，返回 [{name,ip,mac,hostname,iface}]。"""
+        if not self.has_privilege():
+            raise PermissionError(
+                f"创建 OS 级虚拟网卡需要"
+                f"{'管理员权限' if self.os_name == 'windows' else 'root 权限'}"
+                f"（Windows: 右键以管理员运行；Linux: sudo）")
+        plans = self._plan(count, ip_prefix, start)
+        created = []
+        for p in plans:
+            for cmd in p["cmds"]:
+                import subprocess
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                if r.returncode != 0:
+                    # 单个失败（如 IP 已存在）不中断整体
+                    self._cleanup(created)
+                    raise RuntimeError(
+                        f"虚拟网卡创建失败: {' '.join(cmd)}\n{r.stderr.strip()}")
+            rec = {k: p[k] for k in ("name", "ip", "mac", "hostname", "iface")}
+            rec["platform"] = self.os_name
+            created.append(rec)
+        self.nics = created
+        return created
+
+    def destroy(self):
+        """删除本次创建的全部虚拟网卡。"""
+        self._cleanup(self.nics)
+        self.nics = []
+
+    def _cleanup(self, nics):
+        import subprocess
+        for n in nics:
+            try:
+                if n["platform"] == "linux":
+                    subprocess.run(["ip", "link", "del", n["name"]],
+                                   capture_output=True, timeout=10)
+                elif n["platform"] == "windows":
+                    subprocess.run(["netsh", "interface", "ipv4", "delete",
+                                    "address", f'name="{n["iface"]}"', n["ip"]],
+                                   capture_output=True, timeout=10)
+                else:
+                    subprocess.run(["ifconfig", n["iface"], "-alias", n["ip"]],
+                                   capture_output=True, timeout=10)
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+# ---------------------------------------------------------------------------
 # 并发认证会话（多账号多虚拟网卡同时在线）
 # ---------------------------------------------------------------------------
 class AuthSession:
@@ -314,6 +511,8 @@ class AuthSession:
 
     每个实例一个线程，明文身份可用虚拟网卡 (ip/mac/hostname) 覆盖，
     多实例并发即"多网卡多账户认证"。
+    bind_ip：OS 级虚拟网卡 IP——数据包真实源 IP（插卡效果）；
+             None 时仅明文声明身份（协议研究模式）。
     回调（线程安全由调用方保证，UI 用队列）：
         on_log(msg: str)          日志
         on_state(state: str, ok)  state: login/keepalive/reauth/logoff/stopped
@@ -321,10 +520,12 @@ class AuthSession:
 
     def __init__(self, server, username, password, language="1",
                  ip=None, mac=None, hostname=None, interval=20, max_fail=3,
-                 on_log=None, on_state=None):
+                 on_log=None, on_state=None, bind_ip=None, port=3080):
         self.server, self.username, self.password = server, username, password
         self.language = language
         self.ip, self.mac, self.hostname = ip, mac, hostname
+        self.bind_ip = bind_ip
+        self.port = port
         self.interval, self.max_fail = max(3, interval), max_fail
         self.on_log = on_log or (lambda m: None)
         self.on_state = on_state or (lambda s, ok=True: None)
@@ -333,6 +534,8 @@ class AuthSession:
         self.online = False
 
     def nic_desc(self):
+        if self.bind_ip:
+            return f"OS-vnic {self.bind_ip} (real src IP)"
         if self.ip or self.mac:
             return f"vnic {self.ip or '-'}/{self.mac or '-'}"
         return "real nic"
@@ -341,12 +544,13 @@ class AuthSession:
         req, t, data, pt = build_request(
             self.server, self.username, self.password, method,
             self.language, ip=self.ip, mac=self.mac, hostname=self.hostname)
-        resp = send_request(self.server, req, timeout=timeout)
+        resp = send_request(self.server, req, timeout=timeout,
+                            bind_ip=self.bind_ip, port=self.port)
         return OK_MAP[method] in resp, resp
 
     def run(self):
         tag = f"[{self.username}@{self.nic_desc()}]"
-        self.on_log(f"{tag} login -> {self.server}:3080")
+        self.on_log(f"{tag} login -> {self.server}:{self.port}")
         try:
             ok, resp = self._do("login")
         except OSError as e:
@@ -440,30 +644,56 @@ def load_accounts_for_multi(path):
     return creds
 
 
-def multi_login(creds, interval=20):
-    """CLI 多账号并发入口：每账号一线程（Ctrl+C 逐个登出退出）。"""
-    nics = generate_virtual_nics(len(creds))
+def multi_login(creds, interval=20, real_vnic=False, ip_prefix="10.10.94",
+                start=100, iface=None, mask="255.255.255.0"):
+    """CLI 多账号并发入口：每账号一线程（Ctrl+C 逐个登出退出）。
+
+    real_vnic=False：明文虚拟身份（协议研究模式，无需权限）。
+    real_vnic=True ：先经 VirtualNicManager 在 OS 层创建真实虚拟网卡
+                     （Linux macvlan 独立 MAC / Windows IP 别名），每个会话
+                     bind 到各自虚拟 IP 发包——网关看到的就是一张张独立
+                     "插在网关上的实体卡"。退出时自动删除。
+    """
+    mgr = None
     sessions = []
-    for i, c in enumerate(creds):
-        # 未显式配置虚拟网卡的账号自动绑定生成的虚拟网卡
-        c = dict(c)
-        if not (c["ip"] or c["mac"]):
-            c.update(ip=nics[i]["ip"], mac=nics[i]["mac"],
-                     hostname=nics[i]["hostname"])
-        c.setdefault("interval", interval)
-        s = AuthSession(c["server"], c["username"], c["password"],
-                        c["language"], ip=c["ip"], mac=c["mac"],
-                        hostname=c["hostname"], interval=c["interval"])
-        sessions.append(s)
-        s.start()
     try:
-        while any(s.thread and s.thread.is_alive() for s in sessions):
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\n[*] Ctrl+C: logging off all sessions ...")
-        for s in sessions:
-            s.stop(logoff=True)
-        print("[*] all sessions stopped")
+        if real_vnic:
+            mgr = VirtualNicManager(iface=iface, mask=mask)
+            os_vnics = mgr.create(len(creds), ip_prefix, start)
+            for n in os_vnics:
+                print(f"[+] OS vNIC created: {n['name']} on {n['iface']} "
+                      f"{n['ip']} mac={n['mac']} ({n['platform']})")
+        plain_vnics = generate_virtual_nics(len(creds), ip_prefix, start)
+        for i, c in enumerate(creds):
+            c = dict(c)
+            if not (c["ip"] or c["mac"]):
+                if real_vnic:
+                    n = os_vnics[i]
+                    c.update(ip=n["ip"], mac=n["mac"],
+                             hostname=n["hostname"], bind_ip=n["ip"])
+                else:
+                    c.update(ip=plain_vnics[i]["ip"],
+                             mac=plain_vnics[i]["mac"],
+                             hostname=plain_vnics[i]["hostname"])
+            c.setdefault("interval", interval)
+            s = AuthSession(c["server"], c["username"], c["password"],
+                            c["language"], ip=c["ip"], mac=c["mac"],
+                            hostname=c["hostname"], interval=c["interval"],
+                            bind_ip=c.get("bind_ip"))
+            sessions.append(s)
+            s.start()
+        try:
+            while any(s.thread and s.thread.is_alive() for s in sessions):
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n[*] Ctrl+C: logging off all sessions ...")
+            for s in sessions:
+                s.stop(logoff=True)
+            print("[*] all sessions stopped")
+    finally:
+        if mgr:
+            mgr.destroy()
+            print("[*] OS virtual NICs removed")
     return sessions
 
 # ---------------------------------------------------------------------------
@@ -512,6 +742,13 @@ def main():
     ap.add_argument("--multi", metavar="ACCOUNTS_JSON",
                     help="多账号并发模式：accounts.json（UI 同格式），"
                          "未配置虚拟网卡的账号自动生成绑定")
+    ap.add_argument("--real-vnic", action="store_true",
+                    help="OS 级真实虚拟网卡（Linux: macvlan 独立 MAC；"
+                         "Windows: 物理网卡 IP 别名）——数据包源 IP 即虚拟 IP，"
+                         "等效插实体卡到网关。需管理员/root")
+    ap.add_argument("--iface", help="绑定虚拟网卡的物理网卡名（默认自动检测默认路由网卡）")
+    ap.add_argument("--mask", default="255.255.255.0",
+                    help="IP 别名子网掩码（Windows/macOS，默认 255.255.255.0）")
     ap.add_argument("--vnic-ip-prefix", default="10.10.94",
                     help="自动生成虚拟网卡的 IP 前缀（默认 10.10.94）")
     ap.add_argument("--vnic-start", type=int, default=100,
@@ -527,15 +764,12 @@ def main():
         if not creds:
             print("[!] 账号文件为空", file=sys.stderr)
             return 1
-        # 应用自定义虚拟网卡参数
-        nics = generate_virtual_nics(len(creds), args.vnic_ip_prefix,
-                                     args.vnic_start)
-        for i, c in enumerate(creds):
-            if not (c["ip"] or c["mac"]):
-                c.update(ip=nics[i]["ip"], mac=nics[i]["mac"],
-                         hostname=nics[i]["hostname"])
-        print(f"[*] multi-account auth: {len(creds)} sessions")
-        multi_login(creds, args.interval)
+        mode = ("OS 级真实虚拟网卡（等效插实体卡）" if args.real_vnic
+                else "明文虚拟身份（协议研究模式）")
+        print(f"[*] multi-account auth: {len(creds)} sessions, {mode}")
+        multi_login(creds, args.interval, real_vnic=args.real_vnic,
+                    ip_prefix=args.vnic_ip_prefix, start=args.vnic_start,
+                    iface=args.iface, mask=args.mask)
         return 0
     if not args.method:
         ap.print_help()
