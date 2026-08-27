@@ -10,10 +10,13 @@ Python 标准库实现，Windows/macOS/Linux 全平台零依赖
 功能：
     - 多账号管理（增/删/改/保存），密码用原客户端同款算法
       （mfc101f.dll 0x405020/0x405190，种子 0x522）加密存于 accounts.json
-    - 登录 / 自动保活 / 登出（复刻原客户端状态机：
-      连续 3 次无响应 → 'over %d times unreceive data,reauth now'）
-    - 实时日志显示（线程安全）
-    - 跨平台 MAC/IP/主机名采集
+    - 虚拟网卡：自定义数量一键生成（随机 MAC + 顺序 IP），
+      绑定到账号后认证明文使用该虚拟身份（ip|user|pwd|host|...|MAC|...）
+      ——绕开原客户端"单网卡"限制
+    - 多网卡多账户并发认证：每账号独立 AuthSession 线程，
+      同时登录/保活/登出，会话面板实时显示各会话状态
+    - 复刻原客户端状态机：连续 3 次无响应自动重认证
+    - 实时日志（线程安全队列）
 
 用法：
     python3 glaclient_ui.py          # Windows: 双击运行或 python glaclient_ui.py
@@ -33,7 +36,8 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
-from glaclient_reimpl import OK_MAP, build_request, send_request
+from glaclient_reimpl import (AuthSession, OK_MAP, build_request,
+                              generate_virtual_nics, send_request)
 import keep_password_codec as pwcodec
 
 ACCOUNTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -41,42 +45,50 @@ ACCOUNTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 DEFAULT_SERVER = "10.10.94.1"
 MAX_FAIL = 3  # 原客户端保活失败重认证阈值
 
+STATE_TEXT = {
+    "login":      ("在线", "#2e7d32"),
+    "keepalive":  ("在线", "#2e7d32"),
+    "reauth":     ("重连中", "#ef6c00"),
+    "logoff":     ("离线", "#c62828"),
+    "stopped":    ("离线", "#c62828"),
+    "failed":     ("失败", "#c62828"),
+}
+
 
 class AuthUI:
     def __init__(self, root):
         self.root = root
-        root.title("冰川认证客户端（替代版）Glaclient Reimpl")
-        root.geometry("780x560")
-        root.minsize(700, 480)
+        root.title("冰川认证客户端（替代版）Glaclient Reimpl — 多账号多虚拟网卡")
+        root.geometry("860x720")
+        root.minsize(780, 640)
 
-        self.accounts = []           # [{name,username,password_enc,server,language}]
-        self.current = None          # 当前在线账号凭据（运行时内存）
-        self.stop_event = threading.Event()
-        self.worker = None           # 认证/保活线程
-        self.online = False
+        self.accounts = []           # [{name,username,password_enc,server,
+                                     #   language,virtual_ip,virtual_mac,virtual_hostname}]
+        self.sessions = {}           # username -> AuthSession（并发会话）
         self.log_queue = queue.Queue()
 
         self._build_widgets()
         self._load_accounts()
         self._refresh_list()
-        self.root.after(100, self._poll_log_queue)
+        self.root.after(100, self._poll_queue)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.log(f"[*] 账号库: {ACCOUNTS_FILE}")
         self.log("[*] 协议: GET /cgi/client_check (DES-ECB, key=&time=) 端口 3080")
+        self.log("[*] 多账号并发: 每账号独立线程 + 可选虚拟网卡身份")
 
     # ------------------------------------------------------------------ UI
     def _build_widgets(self):
         # 顶部状态栏
         top = ttk.Frame(self.root, padding=(8, 6))
         top.pack(fill=tk.X)
-        ttk.Label(top, text="状态:").pack(side=tk.LEFT)
-        self.status_var = tk.StringVar(value="离线")
+        ttk.Label(top, text="在线会话:").pack(side=tk.LEFT)
+        self.status_var = tk.StringVar(value="0")
         self.status_lbl = ttk.Label(top, textvariable=self.status_var,
-                                    foreground="#c62828", font=("", 10, "bold"))
-        self.status_lbl.pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Label(top, text="当前账号:").pack(side=tk.LEFT, padx=(16, 0))
-        self.cur_var = tk.StringVar(value="-")
-        ttk.Label(top, textvariable=self.cur_var).pack(side=tk.LEFT)
+                                    foreground="#2e7d32", font=("", 10, "bold"))
+        self.status_lbl.pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Label(top, text="/ 已配置账号:").pack(side=tk.LEFT)
+        self.acc_var = tk.StringVar(value="0")
+        ttk.Label(top, textvariable=self.acc_var).pack(side=tk.LEFT)
 
         # 中部：左账号列表 + 右表单
         mid = ttk.Frame(self.root, padding=(8, 2))
@@ -84,7 +96,7 @@ class AuthUI:
 
         left = ttk.LabelFrame(mid, text=" 账号列表 ", padding=5)
         left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 6))
-        self.listbox = tk.Listbox(left, width=26, height=14, exportselection=False)
+        self.listbox = tk.Listbox(left, width=24, height=13, exportselection=False)
         self.listbox.pack(fill=tk.Y)
         self.listbox.bind("<<ListboxSelect>>", self._on_select)
         ttk.Button(left, text="＋ 新建账号", command=self._new_account
@@ -92,7 +104,8 @@ class AuthUI:
         ttk.Button(left, text="✖ 删除账号", command=self._delete_account
                    ).pack(fill=tk.X, pady=(4, 0))
 
-        right = ttk.LabelFrame(mid, text=" 账号信息 ", padding=8)
+        right = ttk.LabelFrame(mid, text=" 账号信息（虚拟网卡留空 = 用真实网卡）",
+                               padding=8)
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.name_var = self._field(right, 0, "备注名称", "宿舍账号")
         self.un_var = self._field(right, 1, "用户名（学号/工号）", "2202160228")
@@ -110,26 +123,76 @@ class AuthUI:
                                 values=("1", "2", "0"), width=6, state="readonly")
         lang_box.grid(row=4, column=1, sticky="w", padx=4, pady=3)
         self.interval_var = self._field(right, 5, "保活间隔（秒）", "20")
+        # 虚拟网卡三字段（绑定到账号）
+        ttk.Separator(right, orient=tk.HORIZONTAL).grid(
+            row=6, column=0, columnspan=3, sticky="ew", pady=(6, 2))
+        ttk.Label(right, text="— 虚拟网卡（本账号绑定的认证身份）—",
+                  foreground="#1565c0").grid(
+            row=7, column=0, columnspan=3, sticky="w", pady=(2, 3))
+        self.vip_var = self._field(right, 8, "虚拟 IP", "")
+        self.vmac_var = self._field(right, 9, "虚拟 MAC", "")
+        self.vhost_var = self._field(right, 10, "虚拟主机名", "")
+        ttk.Button(right, text="🎲 随机 MAC", command=self._rand_mac
+                   ).grid(row=9, column=2, sticky="w", padx=2)
         ttk.Button(right, text="💾 保存账号", command=self._save_account
-                   ).grid(row=6, column=1, sticky="w", padx=4, pady=(8, 2))
+                   ).grid(row=11, column=1, sticky="w", padx=4, pady=(8, 2))
         right.columnconfigure(1, weight=1)
+
+        # 虚拟网卡批量生成区
+        vn = ttk.LabelFrame(self.root,
+                            text=" 虚拟网卡批量生成（自动分配给未绑定的账号） ",
+                            padding=8)
+        vn.pack(fill=tk.X, padx=8, pady=(4, 2))
+        ttk.Label(vn, text="数量:").pack(side=tk.LEFT)
+        self.vnic_count_var = tk.StringVar(value="3")
+        ttk.Spinbox(vn, from_=1, to=64, width=4,
+                    textvariable=self.vnic_count_var).pack(side=tk.LEFT, padx=(2, 10))
+        ttk.Label(vn, text="IP 前缀:").pack(side=tk.LEFT)
+        self.vnic_prefix_var = tk.StringVar(value="10.10.94")
+        ttk.Entry(vn, width=12, textvariable=self.vnic_prefix_var
+                  ).pack(side=tk.LEFT, padx=(2, 10))
+        ttk.Label(vn, text="起始主机号:").pack(side=tk.LEFT)
+        self.vnic_start_var = tk.StringVar(value="100")
+        ttk.Entry(vn, width=6, textvariable=self.vnic_start_var
+                  ).pack(side=tk.LEFT, padx=(2, 10))
+        ttk.Button(vn, text="⚡ 生成并分配",
+                   command=self._generate_vnics).pack(side=tk.LEFT)
+        ttk.Label(vn, text="（02 开头本地管理 MAC，不与真实网卡冲突）",
+                  foreground="#888").pack(side=tk.LEFT, padx=(10, 0))
 
         # 操作区
         act = ttk.LabelFrame(self.root, text=" 认证操作 ", padding=8)
         act.pack(fill=tk.X, padx=8, pady=(4, 2))
-        self.login_btn = ttk.Button(act, text="登录并保活", command=self._login)
+        self.login_btn = ttk.Button(act, text="▶ 登录选中账号", command=self._login)
         self.login_btn.pack(side=tk.LEFT)
-        self.logout_btn = ttk.Button(act, text="登出", command=self._logout,
-                                     state=tk.DISABLED)
+        ttk.Button(act, text="▶▶ 全部登录（多账号并发）",
+                   command=self._login_all).pack(side=tk.LEFT, padx=(8, 0))
+        self.logout_btn = ttk.Button(act, text="■ 登出选中", command=self._logout)
         self.logout_btn.pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(act, text="仅登录一次（不保活）",
-                   command=lambda: self._login(keepalive=False)
+        ttk.Button(act, text="■■ 全部登出", command=self._logout_all
                    ).pack(side=tk.LEFT, padx=(8, 0))
+
+        # 会话面板（多会话实时状态）
+        sf = ttk.LabelFrame(self.root, text=" 在线会话（多网卡多账户） ", padding=4)
+        sf.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 2))
+        cols = ("name", "un", "nic", "state", "last")
+        self.tree = ttk.Treeview(sf, columns=cols, show="headings", height=5)
+        for cid, txt, w, a in (
+                ("name", "账号", 120, "w"), ("un", "用户名", 110, "w"),
+                ("nic", "网卡（IP / MAC）", 250, "w"),
+                ("state", "状态", 70, "center"), ("last", "最后活动", 90, "center")):
+            self.tree.heading(cid, text=txt)
+            self.tree.column(cid, width=w, anchor=a)
+        self.tree.column("name", stretch=True)
+        self.tree.pack(fill=tk.BOTH, expand=True)
+        self.tree.tag_configure("on", foreground="#2e7d32")
+        self.tree.tag_configure("fail", foreground="#c62828")
+        self.tree.tag_configure("warn", foreground="#ef6c00")
 
         # 日志区
         logf = ttk.LabelFrame(self.root, text=" 日志 ", padding=4)
         logf.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 8))
-        self.log_text = ScrolledText(logf, height=9, state=tk.DISABLED,
+        self.log_text = ScrolledText(logf, height=7, state=tk.DISABLED,
                                      font=("Consolas", 9))
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
@@ -137,15 +200,21 @@ class AuthUI:
         """表单行：Label + Entry，返回 StringVar。"""
         var = tk.StringVar(value=default)
         ttk.Label(parent, text=label + ":").grid(
-            row=row, column=0, sticky="e", padx=4, pady=3)
+            row=row, column=0, sticky="e", padx=4, pady=2)
         e = ttk.Entry(parent, textvariable=var, show=show)
-        e.grid(row=row, column=1, sticky="ew", padx=4, pady=3)
+        e.grid(row=row, column=1, sticky="ew", padx=4, pady=2)
         if show:
             self.pwd_entry = e  # 供显示/隐藏切换
         return var
 
     def _toggle_pwd(self):
         self.pwd_entry.config(show="" if self.show_pwd.get() else "*")
+
+    def _rand_mac(self):
+        """表单里随机一个 02 开头的虚拟 MAC。"""
+        import random
+        mac = "02" + "".join("%02X" % random.randrange(256) for _ in range(5))
+        self.vmac_var.set(mac)
 
     # ------------------------------------------------------------- 账号存储
     def _load_accounts(self):
@@ -154,6 +223,7 @@ class AuthUI:
                 self.accounts = json.load(f)
         except (OSError, ValueError):
             self.accounts = []
+        self.acc_var.set(str(len(self.accounts)))
 
     def _save_accounts(self):
         try:
@@ -165,7 +235,10 @@ class AuthUI:
     def _refresh_list(self, select=None):
         self.listbox.delete(0, tk.END)
         for acc in self.accounts:
-            self.listbox.insert(tk.END, acc.get("name", acc["username"]))
+            tag = acc.get("name", acc["username"])
+            vnic = " [V]" if (acc.get("virtual_ip") or acc.get("virtual_mac")) else ""
+            self.listbox.insert(tk.END, tag + vnic)
+        self.acc_var.set(str(len(self.accounts)))
         if select is not None and 0 <= select < len(self.accounts):
             self.listbox.selection_set(select)
             self.listbox.see(select)
@@ -179,10 +252,13 @@ class AuthUI:
         self.un_var.set(acc.get("username", ""))
         try:
             self.pwd_var.set(pwcodec.decode(acc["password_enc"]))
-        except (AssertionError, ValueError):
+        except (AssertionError, ValueError, KeyError):
             self.pwd_var.set("")
         self.server_var.set(acc.get("server", DEFAULT_SERVER))
         self.lang_var.set(acc.get("language", "1"))
+        self.vip_var.set(acc.get("virtual_ip", ""))
+        self.vmac_var.set(acc.get("virtual_mac", ""))
+        self.vhost_var.set(acc.get("virtual_hostname", ""))
 
     def _collect_form(self):
         return {
@@ -191,6 +267,9 @@ class AuthUI:
             "password": self.pwd_var.get(),
             "server": self.server_var.get().strip() or DEFAULT_SERVER,
             "language": self.lang_var.get(),
+            "ip": self.vip_var.get().strip() or None,
+            "mac": self.vmac_var.get().strip() or None,
+            "hostname": self.vhost_var.get().strip() or None,
         }
 
     def _new_account(self):
@@ -200,6 +279,9 @@ class AuthUI:
         self.pwd_var.set("")
         self.server_var.set(DEFAULT_SERVER)
         self.lang_var.set("1")
+        self.vip_var.set("")
+        self.vmac_var.set("")
+        self.vhost_var.set("")
         self.log("[*] 新账号：填写后点「保存账号」")
 
     def _save_account(self):
@@ -214,6 +296,9 @@ class AuthUI:
             "password_enc": pwcodec.encode(cred["password"]),
             "server": cred["server"],
             "language": cred["language"],
+            "virtual_ip": cred["ip"] or "",
+            "virtual_mac": cred["mac"] or "",
+            "virtual_hostname": cred["hostname"] or "",
         }
         sel = self.listbox.curselection()
         idx = sel[0] if sel else len(self.accounts)
@@ -223,7 +308,9 @@ class AuthUI:
             self.accounts.append(entry)
         self._save_accounts()
         self._refresh_list(select=idx)
-        self.log(f"[+] 账号已保存: {entry['name']} ({cred['server']})")
+        nic = f"vNIC {cred['ip']}/{cred['mac']}" if (cred["ip"] or cred["mac"]) \
+              else "real nic"
+        self.log(f"[+] 账号已保存: {entry['name']} ({cred['server']}, {nic})")
 
     def _delete_account(self):
         sel = self.listbox.curselection()
@@ -232,145 +319,205 @@ class AuthUI:
             return
         acc = self.accounts[sel[0]]
         if messagebox.askyesno("删除账号", f"确定删除「{acc['name']}」？"):
+            # 若该账号在线，先停掉会话
+            un = acc.get("username")
+            if un in self.sessions:
+                self.sessions.pop(un).stop(logoff=True)
+                self.tree.delete(un)
             self.accounts.pop(sel[0])
             self._save_accounts()
             self._refresh_list()
             self.log(f"[-] 账号已删除: {acc['name']}")
 
-    # ----------------------------------------------------------------- 认证
-    def _do_method(self, cred, method, timeout=8):
-        """在工作线程中执行一次协议请求（每次重新生成时间密钥）。"""
-        req, t, data, pt = build_request(
-            cred["server"], cred["username"], cred["password"],
-            method, cred.get("language", "1"))
-        resp = send_request(cred["server"], req, timeout=timeout)
-        return OK_MAP[method] in resp, resp
+    # --------------------------------------------------------- 虚拟网卡生成
+    def _generate_vnics(self):
+        """按指定数量生成虚拟网卡并分配给未绑定的账号。"""
+        try:
+            count = max(1, int(self.vnic_count_var.get()))
+            start = int(self.vnic_start_var.get())
+        except ValueError:
+            messagebox.showwarning("提示", "数量/起始主机号必须是整数")
+            return
+        prefix = self.vnic_prefix_var.get().strip() or "10.10.94"
+        nics = generate_virtual_nics(count, prefix, start)
+        assigned = 0
+        j = 0
+        for acc in self.accounts:
+            if not (acc.get("virtual_ip") or acc.get("virtual_mac")):
+                if j < len(nics):
+                    acc["virtual_ip"] = nics[j]["ip"]
+                    acc["virtual_mac"] = nics[j]["mac"]
+                    acc["virtual_hostname"] = nics[j]["hostname"]
+                    j += 1
+                    assigned += 1
+        self._save_accounts()
+        self._refresh_list()
+        for n in nics:
+            self.log(f"[+] vNIC {n['ip']}  {n['mac']}  {n['hostname']}")
+        self.log(f"[+] 已生成 {count} 个虚拟网卡（{prefix}.{start} 起），"
+                 f"已分配 {assigned} 个账号；还可在右侧表单为单账号手工填写")
+        if assigned < len(nics):
+            self.log(f"[*] 提示：{len(nics) - assigned} 个虚拟网卡未分配"
+                     f"（所有账号均已绑定）；新建账号后可再分配")
 
-    def _login(self, keepalive=True):
+    # --------------------------------------------------------- 并发认证会话
+    def _interval(self):
+        try:
+            return max(3, int(self.interval_var.get()))
+        except ValueError:
+            return 20
+
+    def _make_session(self, cred):
+        un = cred["username"]
+        # 同一账号重启：先停旧会话
+        if un in self.sessions:
+            self.sessions.pop(un).stop(logoff=True)
+
+        def on_state(state, ok, _un=un):
+            # 工作线程里调用 -> 入队，UI 线程消费
+            self.log_queue.put(("_state", _un, state, ok))
+
+        s = AuthSession(cred["server"], un, cred["password"],
+                        cred.get("language", "1"),
+                        ip=cred.get("ip"), mac=cred.get("mac"),
+                        hostname=cred.get("hostname"),
+                        interval=self._interval(), max_fail=MAX_FAIL,
+                        on_log=self.log, on_state=on_state)
+        self.sessions[un] = s
+        # 会话表行（iid = username）
+        nic = (f"{cred.get('ip') or '-'}/{cred.get('mac') or '-'}"
+               if (cred.get("ip") or cred.get("mac")) else "真实网卡")
+        if self.tree.exists(un):
+            self.tree.delete(un)
+        self.tree.insert("", tk.END, iid=un,
+                         values=(cred["name"], un, nic, "登录中…", "-"))
+        return s
+
+    def _login(self):
         cred = self._collect_form()
         if not (cred["username"] and cred["password"]):
             messagebox.showwarning("提示", "用户名和密码不能为空")
             return
-        try:
-            interval = max(3, int(self.interval_var.get()))
-        except ValueError:
-            interval = 20
+        s = self._make_session(cred)
+        s.start()
 
-        # 停掉旧线程
-        self.stop_event.set()
-        if self.worker and self.worker.is_alive():
-            self.worker.join(timeout=3)
-        self.stop_event = threading.Event()
-
-        self.current = cred
-        self.login_btn.config(state=tk.DISABLED)
-        self.worker = threading.Thread(
-            target=self._auth_worker, args=(dict(cred), interval, keepalive),
-            daemon=True)
-        self.worker.start()
-
-    def _auth_worker(self, cred, interval, keepalive):
-        self.log(f"[*] login -> {cred['server']}:3080 (un={cred['username']})")
-        try:
-            ok, resp = self._do_method(cred, "login")
-        except OSError as e:
-            ok, resp = False, f"network error: {e}"
-        if not ok:
-            self._set_status(False, cred)
-            self.log(f"[!] login FAILED\n{resp.strip()[:400]}")
+    def _login_all(self):
+        """所有账号并发登录（多账号多虚拟网卡同时认证）。"""
+        if not self.accounts:
+            messagebox.showinfo("提示", "账号库为空，请先保存账号")
             return
-        self._set_status(True, cred)
-        self.log("[+] login OK — auth_ok")
-        if keepalive:
-            self._keepalive_worker(cred, interval)
-
-    def _keepalive_worker(self, cred, interval):
-        """可停止版保活循环（复刻 0x407310 客户端状态机）。"""
-        fails, n = 0, 0
-        while not self.stop_event.is_set():
-            n += 1
+        n = 0
+        for acc in self.accounts:
+            un = acc.get("username")
+            if not un:
+                continue
             try:
-                ok, resp = self._do_method(cred, "keepalive")
-                if ok:
-                    fails = 0
-                    self.log(f"[{time.strftime('%H:%M:%S')}] keepalive #{n}: ok")
-                else:
-                    fails += 1
-                    self.log(f"[!] keepalive #{n}: unexpected response")
-            except OSError as e:
-                fails += 1
-                self.log(f"[!] keepalive #{n} network error: {e}")
-            if fails >= MAX_FAIL:
-                self.log(f"[!] over {MAX_FAIL} times unreceive data, reauth now")
-                try:
-                    ok, _ = self._do_method(cred, "login")
-                    self.log(f"[{'+' if ok else '!'}] reauth "
-                             f"{'OK' if ok else 'FAILED'}")
-                    if ok:
-                        fails = 0
-                except OSError as e:
-                    self.log(f"[!] reauth error: {e}")
-            self.stop_event.wait(interval)
-        self.log("[*] keepalive loop stopped")
+                pwd = pwcodec.decode(acc["password_enc"])
+            except (AssertionError, ValueError, KeyError):
+                self.log(f"[!] 账号 {un} 密码解码失败，跳过")
+                continue
+            cred = {
+                "name": acc.get("name", un), "username": un, "password": pwd,
+                "server": acc.get("server", DEFAULT_SERVER),
+                "language": acc.get("language", "1"),
+                "ip": acc.get("virtual_ip") or None,
+                "mac": acc.get("virtual_mac") or None,
+                "hostname": acc.get("virtual_hostname") or None,
+            }
+            s = self._make_session(cred)
+            s.start()
+            n += 1
+        self.log(f"[*] 已发起 {n} 个并发认证会话")
 
     def _logout(self):
-        cred = self.current
-        if not cred:
+        cred = self._collect_form()
+        un = cred["username"]
+        s = self.sessions.get(un)
+        if not s:
+            messagebox.showinfo("提示", f"账号 {un or '(空)'} 无在线会话")
             return
-        self.stop_event.set()  # 先停保活循环
-        self.logout_btn.config(state=tk.DISABLED)
 
-        def do_logout():
-            try:
-                ok, resp = self._do_method(cred, "logoff")
-                self.log(f"[{'+' if ok else '!'}] logoff "
-                         f"{'OK — logoff_ok' if ok else 'FAILED: ' + resp.strip()[:200]}")
-            except OSError as e:
-                self.log(f"[!] logoff network error: {e}")
-            self._set_status(False, None)
+        def do():
+            s.stop(logoff=True)
+            self.root.after(0, self._remove_session_row, un)
 
-        threading.Thread(target=do_logout, daemon=True).start()
+        threading.Thread(target=do, daemon=True).start()
+
+    def _logout_all(self):
+        for un, s in list(self.sessions.items()):
+            def do(_s=s, _un=un):
+                _s.stop(logoff=True)
+                self.root.after(0, self._remove_session_row, _un)
+            threading.Thread(target=do, daemon=True).start()
+        self.log("[*] 正在登出全部会话…")
+
+    def _remove_session_row(self, un):
+        if un in self.sessions:
+            self.sessions.pop(un)
+        if self.tree.exists(un):
+            self.tree.delete(un)
+        self._update_session_count()
+
+    def _update_session_count(self):
+        n = sum(1 for s in self.sessions.values() if s.online)
+        self.status_var.set(str(n))
+        self.status_lbl.config(foreground="#2e7d32" if n else "#c62828")
 
     # ------------------------------------------------------------ UI 线程安全
     def log(self, msg):
         self.log_queue.put(msg)
 
-    def _poll_log_queue(self):
-        lines = []
+    def _poll_queue(self):
+        logs, states = [], []
         while True:
             try:
-                lines.append(self.log_queue.get_nowait())
+                item = self.log_queue.get_nowait()
             except queue.Empty:
                 break
-        if lines:
+            if isinstance(item, tuple) and item[0] == "_state":
+                states.append(item)
+            else:
+                logs.append(item)
+        if logs:
             self.log_text.config(state=tk.NORMAL)
-            for l in lines:
+            for l in logs:
                 self.log_text.insert(tk.END, l + "\n")
             self.log_text.see(tk.END)
             self.log_text.config(state=tk.DISABLED)
-        self.root.after(100, self._poll_log_queue)
+        for _tag, un, state, ok in states:
+            self._apply_state(un, state, ok)
+        self.root.after(100, self._poll_queue)
 
-    def _set_status(self, online, cred):
-        self.root.after(0, self._apply_status, online, cred)
-
-    def _apply_status(self, online, cred):
-        self.online = online
-        self.status_var.set("在线" if online else "离线")
-        self.status_lbl.config(foreground="#2e7d32" if online else "#c62828")
-        self.cur_var.set(cred["name"] if cred else "-")
-        self.login_btn.config(state=tk.NORMAL)
-        self.logout_btn.config(state=tk.NORMAL if online else tk.DISABLED)
+    def _apply_state(self, un, state, ok):
+        """UI 线程内更新会话表行。"""
+        if not self.tree.exists(un):
+            return
+        s = self.sessions.get(un)
+        values = list(self.tree.item(un, "values"))
+        if state in ("login", "reauth"):
+            values[3] = STATE_TEXT[state][0] if ok else "失败"
+            tag = "on" if ok else "fail"
+        elif state == "keepalive":
+            values[3] = "在线" if ok else "保活失败"
+            tag = "on" if ok else "warn"
+            if ok:
+                values[4] = time.strftime("%H:%M:%S")
+        else:  # stopped / logoff
+            values[3] = "离线"
+            tag = "fail"
+        self.tree.item(un, values=values, tags=(tag,))
+        self._update_session_count()
 
     def _on_close(self):
-        if self.online and self.current:
-            if messagebox.askyesno("退出", "当前在线，退出前登出该账号？"):
-                self.stop_event.set()
-                try:
-                    ok, _ = self._do_method(self.current, "logoff", timeout=3)
-                    self.log(f"[{'+' if ok else '!'}] logoff on exit")
-                except OSError:
-                    pass
-        self.stop_event.set()
+        if any(s.online for s in self.sessions.values()):
+            if not messagebox.askyesno(
+                    "退出", "仍有在线会话，退出前登出全部账号？\n"
+                    "（选「否」将直接退出，会话可能在超时后掉线）"):
+                self.root.destroy()
+                return
+        # 逐个登出（快速关闭：join 超时后仍销毁窗口）
+        for s in list(self.sessions.values()):
+            s.stop(logoff=True, timeout=2)
         self.root.destroy()
 
 

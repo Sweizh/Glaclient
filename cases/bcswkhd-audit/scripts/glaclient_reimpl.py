@@ -26,8 +26,10 @@ glaclient_reimpl.py — 冰川上网客户端（Glaclient v4.12）替代认证�
     python3 glaclient_reimpl.py --selftest        # 离线自检（无需网络）
 """
 import argparse
+import json
 import socket
 import sys
+import threading
 import time
 import uuid
 
@@ -193,17 +195,21 @@ def build_plaintext(ip, username, password, hostname, mac, tail="11111111"):
     parts = [ip, username, password, hostname, seg5, mac, tail]
     return "|".join(parts)
 
-def make_payload(username, password, server_ip):
-    """生成 (time_str, data_hex)——密钥即 &time= 值。"""
+def make_payload(username, password, server_ip, ip=None, mac=None, hostname=None):
+    """生成 (time_str, data_hex, plaintext)——密钥即 &time= 值。
+
+    ip/mac/hostname 传入即"虚拟网卡"覆盖（用于多账号绑定不同身份）；
+    留 None 则自动采集本机真实值（原客户端行为）。
+    """
     t = time.strftime("%H:%M:%S")
-    pt = build_plaintext(local_ip(server_ip), username, password,
-                         local_hostname(), local_mac())
+    pt = build_plaintext(ip or local_ip(server_ip), username, password,
+                         hostname or local_hostname(), mac or local_mac())
     data = des_ecb_encrypt(pt.encode("ascii"), t.encode("ascii")).hex().upper()
     return t, data, pt
 
 def build_request(server_ip, username, password, method="login",
-                  language="1", debug="no"):
-    t, data, pt = make_payload(username, password, server_ip)
+                  language="1", debug="no", ip=None, mac=None, hostname=None):
+    t, data, pt = make_payload(username, password, server_ip, ip, mac, hostname)
     req = (
         f"GET /cgi/client_check?un={username}&mymethod={method}"
         f"&login_client=win32&language={language}&time={t}&data={data}"
@@ -238,8 +244,10 @@ def send_request(server_ip, req, timeout=8):
     finally:
         s.close()
 
-def do_method(server_ip, username, password, method, verbose=True):
-    req, t, data, pt = build_request(server_ip, username, password, method)
+def do_method(server_ip, username, password, method, verbose=True,
+              ip=None, mac=None, hostname=None, language="1"):
+    req, t, data, pt = build_request(server_ip, username, password, method,
+                                     language, ip=ip, mac=mac, hostname=hostname)
     if verbose:
         print(f"[*] plaintext : {pt}")
         print(f"[*] time/key  : {t}")
@@ -279,6 +287,186 @@ def keepalive_loop(server_ip, username, password, interval=20, max_fail=3):
         time.sleep(interval)
 
 # ---------------------------------------------------------------------------
+# 虚拟网卡
+# ---------------------------------------------------------------------------
+def generate_virtual_nics(count, ip_prefix="10.10.94", start=100):
+    """生成 count 个虚拟网卡 [(ip, mac, hostname), ...]。
+
+    MAC：02 开头（IEEE 本地管理位/单播，不会撞真实厂商网卡）+ 5 随机字节。
+    IP ：ip_prefix.<start+i>（例 prefix="10.10.94", start=100 -> 10.10.94.100）。
+    hostname：GLA-VNIC-<序号>。
+    认证明文中的 ip/mac/hostname 将使用这些值——即"虚拟网卡"身份。
+    """
+    import random
+    nics = []
+    for i in range(count):
+        mac = "02" + "".join("%02X" % random.randrange(256) for _ in range(5))
+        ip = f"{ip_prefix}.{start + i}"
+        host = f"GLA-VNIC-{i + 1:02d}"
+        nics.append({"ip": ip, "mac": mac, "hostname": host})
+    return nics
+
+# ---------------------------------------------------------------------------
+# 并发认证会话（多账号多虚拟网卡同时在线）
+# ---------------------------------------------------------------------------
+class AuthSession:
+    """单账号认证会话：登录 -> 后台保活 -> 登出。
+
+    每个实例一个线程，明文身份可用虚拟网卡 (ip/mac/hostname) 覆盖，
+    多实例并发即"多网卡多账户认证"。
+    回调（线程安全由调用方保证，UI 用队列）：
+        on_log(msg: str)          日志
+        on_state(state: str, ok)  state: login/keepalive/reauth/logoff/stopped
+    """
+
+    def __init__(self, server, username, password, language="1",
+                 ip=None, mac=None, hostname=None, interval=20, max_fail=3,
+                 on_log=None, on_state=None):
+        self.server, self.username, self.password = server, username, password
+        self.language = language
+        self.ip, self.mac, self.hostname = ip, mac, hostname
+        self.interval, self.max_fail = max(3, interval), max_fail
+        self.on_log = on_log or (lambda m: None)
+        self.on_state = on_state or (lambda s, ok=True: None)
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.online = False
+
+    def nic_desc(self):
+        if self.ip or self.mac:
+            return f"vnic {self.ip or '-'}/{self.mac or '-'}"
+        return "real nic"
+
+    def _do(self, method, timeout=8):
+        req, t, data, pt = build_request(
+            self.server, self.username, self.password, method,
+            self.language, ip=self.ip, mac=self.mac, hostname=self.hostname)
+        resp = send_request(self.server, req, timeout=timeout)
+        return OK_MAP[method] in resp, resp
+
+    def run(self):
+        tag = f"[{self.username}@{self.nic_desc()}]"
+        self.on_log(f"{tag} login -> {self.server}:3080")
+        try:
+            ok, resp = self._do("login")
+        except OSError as e:
+            ok, resp = False, f"network error: {e}"
+        if not ok:
+            self.online = False
+            self.on_state("login", False)
+            self.on_log(f"{tag} login FAILED: {str(resp).strip()[:200]}")
+            return
+        self.online = True
+        self.on_state("login", True)
+        self.on_log(f"{tag} login OK")
+        # 保活循环（复刻原客户端状态机）
+        fails, n = 0, 0
+        while not self.stop_event.is_set():
+            n += 1
+            try:
+                ok, _ = self._do("keepalive")
+                if ok:
+                    fails = 0
+                    self.on_state("keepalive", True)
+                else:
+                    fails += 1
+                    self.on_state("keepalive", False)
+            except OSError as e:
+                fails += 1
+                self.on_log(f"{tag} keepalive #{n} error: {e}")
+            if fails >= self.max_fail:
+                self.on_log(f"{tag} over {self.max_fail} times unreceive "
+                            f"data, reauth now")
+                try:
+                    ok, _ = self._do("login")
+                    self.on_state("reauth", ok)
+                    if ok:
+                        self.online, fails = True, 0
+                except OSError as e:
+                    self.on_log(f"{tag} reauth error: {e}")
+            self.stop_event.wait(self.interval)
+        self.on_log(f"{tag} keepalive loop stopped")
+        self.on_state("stopped", False)
+
+    def start(self):
+        if self.thread and self.thread.is_alive():
+            return
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def stop(self, logoff=True, timeout=3):
+        """停止保活并（可选）登出。阻塞至线程退出或超时。"""
+        self.stop_event.set()
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=timeout)
+        if logoff and self.online:
+            try:
+                ok, _ = self._do("logoff", timeout=timeout)
+                self.on_log(f"[{self.username}] logoff "
+                            f"{'OK' if ok else 'FAILED'}")
+            except OSError as e:
+                self.on_log(f"[{self.username}] logoff error: {e}")
+        self.online = False
+
+
+def load_accounts_for_multi(path):
+    """读取多账号配置（兼容 UI 的 accounts.json 与明文格式）。
+
+    每项字段：username, password 或 password_enc, server, language,
+              virtual_ip, virtual_mac, virtual_hostname, interval
+    """
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    import keep_password_codec as pwcodec
+    creds = []
+    for a in raw:
+        pwd = a.get("password")
+        if pwd is None and a.get("password_enc"):
+            try:
+                pwd = pwcodec.decode(a["password_enc"])
+            except (AssertionError, ValueError):
+                pwd = ""
+        creds.append({
+            "username": a["username"],
+            "password": pwd or "",
+            "server": a.get("server", "10.10.94.1"),
+            "language": a.get("language", "1"),
+            "ip": a.get("virtual_ip") or None,
+            "mac": a.get("virtual_mac") or None,
+            "hostname": a.get("virtual_hostname") or None,
+            "interval": int(a.get("interval", 20)),
+        })
+    return creds
+
+
+def multi_login(creds, interval=20):
+    """CLI 多账号并发入口：每账号一线程（Ctrl+C 逐个登出退出）。"""
+    nics = generate_virtual_nics(len(creds))
+    sessions = []
+    for i, c in enumerate(creds):
+        # 未显式配置虚拟网卡的账号自动绑定生成的虚拟网卡
+        c = dict(c)
+        if not (c["ip"] or c["mac"]):
+            c.update(ip=nics[i]["ip"], mac=nics[i]["mac"],
+                     hostname=nics[i]["hostname"])
+        c.setdefault("interval", interval)
+        s = AuthSession(c["server"], c["username"], c["password"],
+                        c["language"], ip=c["ip"], mac=c["mac"],
+                        hostname=c["hostname"], interval=c["interval"])
+        sessions.append(s)
+        s.start()
+    try:
+        while any(s.thread and s.thread.is_alive() for s in sessions):
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n[*] Ctrl+C: logging off all sessions ...")
+        for s in sessions:
+            s.stop(logoff=True)
+        print("[*] all sessions stopped")
+    return sessions
+
+# ---------------------------------------------------------------------------
 # 自检（离线）
 # ---------------------------------------------------------------------------
 def selftest():
@@ -286,12 +474,30 @@ def selftest():
     kat = _des_block(b"\x00" * 8, subkeys(b"\x00" * 8))
     assert kat.hex().upper() == "8CA64DE9C1B123A7"
     print("[+] DES NBS KAT passed (8CA64DE9C1B123A7)")
-    # 请求构建 roundtrip
+    # 请求构建 roundtrip（真实网卡）
     req, t, data, pt = build_request("10.10.94.1", "2202160228", "169332", "login")
     rt = des_ecb_decrypt(bytes.fromhex(data), t.encode("ascii")).decode("ascii")
     assert rt == pt
     print(f"[+] request build OK; plaintext = {pt!r}")
-    print(f"[+] time key = {t!r}  data = {data}")
+    # 虚拟网卡 roundtrip
+    nics = generate_virtual_nics(2, ip_prefix="10.10.94", start=100)
+    for n in nics:
+        assert n["mac"].startswith("02") and len(n["mac"]) == 12
+    v = nics[0]
+    req2, t2, data2, pt2 = build_request(
+        "10.10.94.1", "2202160228", "169332", "login",
+        ip=v["ip"], mac=v["mac"], hostname=v["hostname"])
+    rt2 = des_ecb_decrypt(bytes.fromhex(data2), t2.encode("ascii")).decode("ascii")
+    assert rt2 == pt2
+    assert pt2.split("|")[0] == v["ip"] and pt2.split("|")[7] == v["mac"]
+    print(f"[+] virtual NIC build OK; plaintext = {pt2!r}")
+    print(f"[+] generated {len(nics)} vNICs: "
+          f"{[n['ip'] + '/' + n['mac'] for n in nics]}")
+    # AuthSession 可实例化（不启动线程）
+    s = AuthSession("10.10.94.1", "2202160228", "169332",
+                    ip=v["ip"], mac=v["mac"], hostname=v["hostname"])
+    assert s.nic_desc().startswith("vnic")
+    print(f"[+] AuthSession construct OK ({s.nic_desc()})")
     print(f"\n{req}")
     return 0
 
@@ -303,17 +509,39 @@ def main():
     ap.add_argument("--pwd", help="密码")
     ap.add_argument("--interval", type=int, default=20, help="keepalive 间隔秒数")
     ap.add_argument("--selftest", action="store_true", help="离线自检（不联网）")
+    ap.add_argument("--multi", metavar="ACCOUNTS_JSON",
+                    help="多账号并发模式：accounts.json（UI 同格式），"
+                         "未配置虚拟网卡的账号自动生成绑定")
+    ap.add_argument("--vnic-ip-prefix", default="10.10.94",
+                    help="自动生成虚拟网卡的 IP 前缀（默认 10.10.94）")
+    ap.add_argument("--vnic-start", type=int, default=100,
+                    help="自动生成虚拟网卡的起始主机号（默认 100）")
     ap.add_argument("method", nargs="?", choices=["login", "keepalive", "logoff"],
-                    help="认证动作")
+                    help="认证动作（单账号模式）")
     args = ap.parse_args()
 
     if args.selftest:
         return selftest()
+    if args.multi:
+        creds = load_accounts_for_multi(args.multi)
+        if not creds:
+            print("[!] 账号文件为空", file=sys.stderr)
+            return 1
+        # 应用自定义虚拟网卡参数
+        nics = generate_virtual_nics(len(creds), args.vnic_ip_prefix,
+                                     args.vnic_start)
+        for i, c in enumerate(creds):
+            if not (c["ip"] or c["mac"]):
+                c.update(ip=nics[i]["ip"], mac=nics[i]["mac"],
+                         hostname=nics[i]["hostname"])
+        print(f"[*] multi-account auth: {len(creds)} sessions")
+        multi_login(creds, args.interval)
+        return 0
     if not args.method:
         ap.print_help()
         return 1
     if not args.un or not args.pwd:
-        print("[!] 需要 --un 和 --pwd（或先运行 --selftest 验证协议层）", file=sys.stderr)
+        print("[!] 需要 --un 和 --pwd（或 --multi accounts.json）", file=sys.stderr)
         return 1
 
     if args.method == "keepalive":
