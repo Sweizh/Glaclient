@@ -5,7 +5,7 @@
 - 分析方式：本地沙盒离线静态逆向（全程未执行任何样本）
 - 分析对象：gcsetup.exe 安装器 + 安装目录全套文件
 - 语言/工具链：C++（MFC 10.0，MSVC 2010），主逻辑位于伪装的 `mfc101f.dll`
-- 厂商：冰川网络 Glacier Network（www.bingchuan.net），版权 2007–2016
+- 厂商：冰川网络 Glacier Network（www.bingchuan.net）  ，版权 2007–2016
 
 ---
 
