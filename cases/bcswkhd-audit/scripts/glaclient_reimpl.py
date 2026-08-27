@@ -145,38 +145,38 @@ def local_ip(server_ip):
     except OSError:
         return "0.0.0.0"
 
-def local_mac(ip=None):
-    """从系统路由表读取指定 IP 的网卡 MAC（Linux: /sys/class/net）。"""
+def local_mac():
+    """跨平台 MAC 获取：Linux 读 /sys/class/net，Windows/macOS 用 uuid.getnode()。"""
     import os, glob
-    # 路由查网卡
-    iface = None
+    # Linux: 默认路由网卡的 /sys/class/net/<dev>/address
     try:
         with open("/proc/net/route") as f:
             lines = f.read().splitlines()[1:]
         best = None
         for l in lines:
             p = l.split()
-            dest, mask, flags, dev = int(p[1], 16), int(p[7], 16), int(p[3], 16), p[0]
-            if flags & 2:  # gateway route
-                continue
-            if dest == 0 and (best is None or 1):
-                best = dev
-        iface = best
+            if int(p[1], 16) == 0:  # destination 0.0.0.0 = 默认路由
+                best = p[0]
+                break
+        if best is None:
+            for p in glob.glob("/sys/class/net/*/"):
+                n = os.path.basename(p.rstrip("/"))
+                if n != "lo":
+                    best = n
+                    break
+        if best:
+            try:
+                with open(f"/sys/class/net/{best}/address") as f:
+                    return f.read().strip().upper().replace(":", "")
+            except OSError:
+                pass
     except OSError:
         pass
-    if iface is None:
-        for p in glob.glob("/sys/class/net/*/"):
-            n = os.path.basename(p.rstrip("/"))
-            if n != "lo":
-                iface = n
-                break
-    if iface:
-        try:
-            with open(f"/sys/class/net/{iface}/address") as f:
-                return f.read().strip().upper().replace(":", "")
-        except OSError:
-            pass
-    return "000000000000"
+    # Windows / macOS / 兜底：uuid.getnode() 返回活动网卡 MAC
+    mac = uuid.getnode()
+    if (mac >> 40) & 1:  # multicast bit 置位 = 伪随机 MAC（拿不到真实值）
+        return "000000000000"
+    return "%012X" % mac
 
 def local_hostname():
     return socket.gethostname().upper()

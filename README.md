@@ -49,7 +49,8 @@
     ├── reports/README.md              # ★ 完整逆向报告（入口）
     ├── reports/vulnerability-report.md # 正式漏洞报告
     ├── reports/analysis-report.md     # 前期分析报告
-    ├── scripts/                       # 17 个分析/解密脚本（全部可运行）
+    ├── scripts/                       # 18 个分析/解密脚本（全部可运行）
+    │   ├── glaclient_ui.py            # ★★ 图形界面（多账号管理，Windows 支持）
     │   ├── glaclient_reimpl.py        # ★★ 替代认证客户端（登录/保活/登出）
     │   ├── des_data_codec.py          # ★ &data= DES 编解码器（NBS KAT 验证）
     │   ├── keep_password_codec.py     # ★ KeepPassword 编解码器
@@ -93,6 +94,24 @@ python3 glaclient_reimpl.py --server 10.10.94.1 --un <用户名> --pwd <密码> 
 与原客户端行为对照：明文结构 `ip|user|pwd|host|0|||MAC|11111111`（0x407310）、
 密钥 = `&time=` 同值（DES-ECB）、`mymethod` 三态路由、keepalive 失败重认证阈值
 （`over %d times unreceive data,reauth now`）均逐函数逆向恢复并通过 roundtrip 验证。
+
+## 图形界面版（多账号 + Windows 支持）
+
+`scripts/glaclient_ui.py` 提供完整 GUI（Python 标准库 tkinter，**零第三方依赖**，
+Windows 官方 Python 安装包自带 tkinter）：
+
+- **多账号管理**：增/删/改/保存，列表点选即载入；密码以原客户端 `[KeepPassword]`
+  同款算法（种子 0x522）加密存储于同目录 `accounts.json`
+- **一键登录并保活**：复刻原客户端状态机（连续 3 次无响应自动重认证），
+  线程运行不卡界面，可随时登出
+- **跨平台环境采集**：Linux 读 `/sys/class/net`，Windows/macOS 走 `uuid.getnode()`
+- **实时日志**：每次请求的时间密钥、响应判定结果全可见
+- Windows 上推荐 `pythonw glaclient_ui.py`（无控制台窗口）或用
+  `pyinstaller --onefile --noconsole glaclient_ui.py` 打包成单个 exe
+
+```bash
+python3 scripts/glaclient_ui.py     # Windows: python glaclient_ui.py
+```
 
 ## 样本哈希
 
