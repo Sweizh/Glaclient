@@ -1,9 +1,85 @@
-# 冰川上网客户端安装包
+# 冰川上网客户端（Glaclient v4.12）逆向分析仓库
 
-系统限制：仅支持 Windows 平台
+对"冰川上网客户端"win32 Portal 认证客户端的完整离线静态逆向分析案例。
+样本：`gcsetup.exe` 安装器 + `冰川上网客户端安装目录文件.zip`（安装目录全套文件）。
 
-网卡限制：必须保持单网卡环境才能认证，这直接导致通过 Windows 网络共享功能实现其他设备上网的方法直接报废；
+- 厂商：冰川网络 Glacier Network（www.bingchuan.net），版权 2007–2016
+- 客户端核心：`Login` v4.12（PDB 路径 `\4.12\Release\Login.pdb`）
+- 分析方式：本地沙盒离线静态逆向（全程未执行任何样本）
+- **完整报告：[cases/bcswkhd-audit/reports/README.md](cases/bcswkhd-audit/reports/README.md)**
 
-进程隐藏：每次启动会生成随机英文字符名的 exe 文件，想通过防火墙隔离都无从下手；
+---
 
-动态认证：虽然是Windows程序，但是通过Wireshark抓包可以发现程序认证设备使用的是http协议，向10.10.94.1的网关发送认证，认证的密钥每秒都在变化，想模拟请求绕开客户端也不现实。
+## 原始 README（现场观察，保留存档）
+
+> 系统限制：仅支持 Windows 平台
+>
+> 网卡限制：必须保持单网卡环境才能认证，这直接导致通过 Windows 网络共享功能实现其他设备上网的方法直接报废；
+>
+> 进程隐藏：每次启动会生成随机英文字符名的 exe 文件，想通过防火墙隔离都无从下手；
+>
+> 动态认证：虽然是Windows程序，但是通过Wireshark抓包可以发现程序认证设备使用的是http协议，向10.10.94.1的网关发送认证，认证的密钥每秒都在变化，想模拟请求绕开客户端也不现实。
+
+## 逆向验证结论（对照原始观察）
+
+| 原始观察 | 逆向验证结果 |
+|---|---|
+| 进程隐藏：随机英文字母名 exe | **已证实**：32KB 启动器 Glaclient.exe（`requireAdministrator`）将 `mfc101f.dll` 复制为随机名 EXE 执行；两者 SHA-256 完全一致（`b0520f94…`），伪装成 MFC101F.DLL（非微软真实模块名） |
+| 网卡限制：单网卡 | **已证实**：导入 IPHLPAPI（GetAdaptersInfo）+ `UsedMac`/`RealMac`/`ChoosedNetCard`，MAC 绑定校验 |
+| 动态认证：密钥每秒变化，无法模拟 | **已证伪**：认证为 `GET /cgi/client_check?...`（端口 3080 明文 HTTP），`&data=` 为 DES-ECB 密文，**密钥就是同一 URL 里明文传输的 `&time=HH:MM:SS` 参数**。抓包者可零成本实时解出用户名+密码明文——"每秒变密钥"不构成防护 |
+| HTTP 协议（Wireshark 可见） | **已证实**：3080 端口明文 HTTP/1.0，完整请求格式已恢复（见报告第三节） |
+
+## 关键发现速览
+
+1. **VULN-01（严重）** DES 密钥随文明文传输——`&data=` 用标准 DES-ECB，密钥 = 请求内明文 `&time=` 参数
+2. **VULN-02（高）** HTTP 明文认证通道（CWE-319）
+3. **VULN-03（高）** "记住密码"以静态密钥 0x522 可逆存储于 config.ini（实测解出两账户明文口令）
+4. **VULN-04（中）** 管理员权限常驻 + DLL 伪装/随机进程名（CWE-250/1036）
+5. **安装器/卸载器**：Astrum InstallWizard（Thraex Software）官方组件，无恶意行为
+6. **总体**：无后门/无恶意植入，风险集中于弱密码学设计
+
+## 仓库结构
+
+```text
+├── README.md                          # 本文件
+├── gcsetup.exe                        # 样本：安装器（Astrum InstallWizard）
+├── 冰川上网客户端安装目录文件.zip       # 样本：安装目录全套
+├── bcswkhd/                           # 原始样本的另一工作副本（勿改）
+└── cases/bcswkhd-audit/               # 逆向分析案例
+    ├── reports/README.md              # ★ 完整逆向报告（入口）
+    ├── reports/vulnerability-report.md # 正式漏洞报告
+    ├── reports/analysis-report.md     # 前期分析报告
+    ├── scripts/                       # 16 个分析/解密脚本（全部可运行）
+    │   ├── des_data_codec.py          # ★ &data= DES 编解码器（NBS KAT 验证）
+    │   ├── keep_password_codec.py     # ★ KeepPassword 编解码器
+    │   └── des_tables_check.py        # DES 8 表 FIPS 46 一致性验证
+    ├── artifacts/extracted/           # 样本解包（含 config.ini 密文证据）
+    ├── triage/                        # 样本分诊
+    ├── notes/                         # 假设/沙盒规则/决策记录
+    └── disasm_text.txt                # mfc101f.dll 全量反汇编（15,672 行）
+```
+
+## 快速验证（解密演示）
+
+```bash
+# DES &data= 编解码（抓包 -> 明文）
+python3 cases/bcswkhd-audit/scripts/des_data_codec.py
+# 输出: NBS KAT passed + roundtrip OK（明文格式 ≈ "用户名|密码|主机名"）
+
+# 本地记住密码解密（config.ini -> 明文口令）
+python3 cases/bcswkhd-audit/scripts/keep_password_codec.py
+```
+
+## 样本哈希
+
+| 文件 | SHA-256 |
+|---|---|
+| gcsetup.exe | abe044b3b0f16327609ec3fa49208b05cf55053c8fcff5e75ffe7b894d0b52b8 |
+| mfc101f.dll = pkjiobcbzxzvbbccdrlr.exe | b0520f94…（逐字节一致，伪装铁证） |
+| Glaclient.exe | 7a339285…e119a99c |
+| Uninstall.exe | 529b4f68287b93b417829f2342a86e4ae5de0dd636783dcd2b32ee85376555d9 |
+
+---
+
+> 分析范围与限制：纯静态逆向；未执行样本、未验证服务器侧行为与升级代码完整路径。
+> 本仓库仅用于授权安全研究/教学用途。

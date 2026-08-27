@@ -1,0 +1,17 @@
+{
+  "case_name": "bcswkhd-audit",
+  "case_id": "bcswkhd-audit",
+  "goal": "Triage and reverse the Glacier campus-network auth client (gcsetup.exe + installed-directory zip) in local sandbox",
+  "scope": "local sandbox",
+  "created_utc": "2026-08-27T03:49:11.528260+00:00",
+  "directories": [
+    "artifacts",
+    "triage",
+    "reports",
+    "logs",
+    "notes",
+    "exports",
+    "tools",
+    "prompts"
+  ]
+}
