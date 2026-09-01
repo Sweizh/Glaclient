@@ -10,7 +10,7 @@ ov = data[0x2d600:]
 # 1. find key file names / script keywords across whole overlay
 print("=== keyword hits in overlay ===")
 kws = [b"Glaclient", b"mfc101f", b"mfc100u", b"msvcr100", b"Packet.dll", b"Uninstall",
-       b"bingchuan", b"glacier", b"bcswkhd", b"304|3080", b"client_check",
+       b"bingchuan", b"glacier", b"glaclient", b"304|3080", b"client_check",
        b"config.ini", b"www.", b"http", b"Version", b"INSTALLDIR", b"PROGRAMDIR",
        b".exe", b".dll", b".ini", b"setup", b"batch", b"run", b"exec", b"copy", b"register",
        b"REG", b"HKEY", b"CreateFile", b"WriteFile"]
