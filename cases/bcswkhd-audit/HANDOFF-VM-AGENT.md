@@ -166,10 +166,12 @@
 https://github.com/Sweizh/Glaclient
 ```
 
-**校园网直连 GitHub 不通**，未认证的 Debian VM 必须走生产代理 clone（这是代理唯一允许的用途之一）：
+**校园网直连 GitHub 不通**，未认证的 Debian VM 必须走生产代理 clone（这是代理唯一允许的用途之一）。
+
+**⚠ 必须指定分支 `trae/agent-E6ukCg`**——默认 clone 拉的是 main，main 缺少 7 个关键提交（`glaclient_reimpl.py`、`glaclient_ui.py`、本文档等均在分支上，未合入 main）：
 
 ```bash
-HTTPS_PROXY=http://10.10.94.21:7897 git clone https://github.com/Sweizh/Glaclient
+HTTPS_PROXY=http://10.10.94.21:7897 git clone -b trae/agent-E6ukCg https://github.com/Sweizh/Glaclient
 ```
 
 clone 后的关键内容：
