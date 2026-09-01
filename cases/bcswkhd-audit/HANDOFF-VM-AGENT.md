@@ -2,7 +2,7 @@
 
 > **本文档用途**：交给测试虚拟机（Debian）里的 TraeCode CLI Agent，使其在无需历史对话上下文的情况下接管项目。
 > **生成时间**：2026-08-27 · 基于完整离线静态逆向 + 多轮方案讨论
-> **上游仓库**：本目录（cases/bcswkhd-audit）需随本文档一起拷入 Debian VM
+> **上游仓库**：https://github.com/Sweizh/Glaclient （Agent 进场第一件事：clone 该仓库，见 §8）
 
 ---
 
@@ -34,7 +34,7 @@
 
 **安全结论**（已写入漏洞报告）：DES 密钥随请求明文传输，抓包者可零成本实时解出账号密码；HTTP 明文通道；"密钥每秒变化"不构成防护。
 
-### 1.2 已交付代码（在 `scripts/` 目录，全部可运行）
+### 1.2 已交付代码（仓库 `cases/bcswkhd-audit/scripts/` 目录，全部可运行）
 
 | 文件 | 作用 |
 |---|---|
@@ -54,13 +54,13 @@
 
 | 设备 | IP | 角色 | Agent 权限 |
 |---|---|---|---|
-| Win11 虚拟机 | 10.10.94.22 | 冰川认证 + ClashVerge(7897) + CCproxy(1080) + 达芬奇项目库 | **禁止一切操作**（含抓包——金标准抓包在测试 Win 上做） |
+| Win11 虚拟机 | 10.10.94.21 | 冰川认证 + ClashVerge(7897) + CCproxy(1080) + 达芬奇项目库 | **禁止一切操作**（含抓包——金标准抓包在测试 Win 上做） |
 | iStoreOS 虚拟机 | 10.10.94.40 | 团队网关 V2rayA 分流，全实验室依赖 | **禁止一切操作** |
 | 小米 CR8806 | 10.10.94.30 | ImmortalWrt 无线发射（MT7621） | **禁止一切操作** |
 | 飞牛 NAS 宿主机 | 10.10.94.31 | fnOS + OVS + 全部虚拟机 | 仅通过其虚拟机界面**新建**测试 VM，不动现有配置 |
 | 校园网关 | 10.10.94.1:3080 | Portal 认证，单账号限速 ~100Mbps | 测试对象 |
 
-**关键现网事实**：团队全部流量经代理从 10.10.94.22 的认证 IP 出去 = 网关按 IP 认证、不限制 IP 背后连接数的现成实证。全团队共享单账号 100Mbps 是本项目要解决的痛点。
+**关键现网事实**：团队全部流量经代理从 10.10.94.21 的认证 IP 出去 = 网关按 IP 认证、不限制 IP 背后连接数的现成实证。全团队共享单账号 100Mbps 是本项目要解决的痛点。
 
 ---
 
@@ -74,7 +74,7 @@
 
 **网络要点**：
 - 三台 VM 网卡均出自飞牛 OVS bridge——macvlan 在 VM 内部虚拟网卡上建，OVS 只做 MAC 学习，无障碍。
-- 未认证设备无外网。**Agent 的 API 流量走代理**：`HTTP_PROXY/HTTPS_PROXY=http://10.10.94.22:7897`，且必须 `NO_PROXY=10.10.94.1,10.0.0.0/8,localhost`。
+- 未认证设备无外网。**Agent 的 API 流量走代理**：`HTTP_PROXY/HTTPS_PROXY=http://10.10.94.21:7897`，且必须 `NO_PROXY=10.10.94.1,10.0.0.0/8,localhost`。
 - **铁律：认证请求绝不走代理**，必须直连 10.10.94.1:3080，否则测试作废且可能干扰生产认证。
 
 ---
@@ -158,23 +158,48 @@
 
 ---
 
-## 8. 随身文件清单（拷入 Debian VM 的内容）
+## 8. 仓库获取（Agent 进场第一步）
+
+本文档单独交付；全部代码、脚本、逆向报告在 GitHub 仓库：
 
 ```
-cases/bcswkhd-audit/
-├── HANDOFF-VM-AGENT.md      # 本文档
-├── scripts/                 # 全部脚本（glaclient_reimpl.py 为对拍基准）
-├── reports/README.md        # 完整逆向报告（协议细节的权威来源）
-└── reports/vulnerability-report.md
+https://github.com/Sweizh/Glaclient
 ```
 
-Agent 开工自检：`python3 scripts/des_data_codec.py` 应输出 NBS KAT passed + roundtrip OK——不通过说明文件拷贝不完整，先解决再动。
+**校园网直连 GitHub 不通**，未认证的 Debian VM 必须走生产代理 clone（这是代理唯一允许的用途之一）：
+
+```bash
+HTTPS_PROXY=http://10.10.94.21:7897 git clone https://github.com/Sweizh/Glaclient
+```
+
+clone 后的关键内容：
+
+```
+Glaclient/
+├── cases/bcswkhd-audit/
+│   ├── HANDOFF-VM-AGENT.md      # 本文档（若未单独收到，从仓库读）
+│   ├── scripts/                 # 全部脚本（glaclient_reimpl.py 为对拍基准）
+│   ├── reports/README.md        # 完整逆向报告（协议细节的权威来源）
+│   └── reports/vulnerability-report.md
+├── README.md                    # 逆向结论速览
+├── gcsetup.exe                  # 样本：安装器（勿执行）
+└── 冰川上网客户端安装目录文件.zip # 样本：安装目录全套（勿解压执行）
+```
+
+Agent 开工自检（clone 完成后立即执行）：
+
+```bash
+cd Glaclient/cases/bcswkhd-audit
+python3 scripts/des_data_codec.py   # 应输出 NBS KAT passed + roundtrip OK
+```
+
+不通过说明 clone 不完整或文件损坏，先解决再动。后续开发工作目录即 `Glaclient/`，所有新代码提交回该仓库。
 
 ---
 
 ## 9. Agent 行为约定
 
-- 收到本文档 + §4 凭据清单后，先逐台连通性巡检（ping/SSH），再进阶段 1。
+- 收到本文档 + §4 凭据清单后：先走代理 clone 仓库（§8）并跑开工自检，再逐台连通性巡检（ping/SSH），最后进阶段 1。
 - 每阶段结束出报告，等用户确认再进下一阶段（阶段 2→3 之间必须停）。
 - 长编译任务 nohup 后台跑，会话断了下轮回收。
 - 遇协议不符/网关异常/权限不足三类问题：停止、记录、报告，不猜测强推。
