@@ -6,7 +6,7 @@
 - 厂商：冰川网络 Glacier Network（www.bingchuan.net），版权 2007–2016
 - 客户端核心：`Login` v4.12（PDB 路径 `\4.12\Release\Login.pdb`）
 - 分析方式：本地沙盒离线静态逆向（全程未执行任何样本）
-- **完整报告：[cases/bcswkhd-audit/reports/README.md](cases/bcswkhd-audit/reports/README.md)**
+- **完整报告：[analysis/reports/README.md](analysis/reports/README.md)**
 
 ---
 
@@ -26,7 +26,7 @@
 |---|---|
 | 进程隐藏：随机英文字母名 exe | **已证实**：32KB 启动器 Glaclient.exe（`requireAdministrator`）将 `mfc101f.dll` 复制为随机名 EXE 执行；两者 SHA-256 完全一致（`b0520f94…`），伪装成 MFC101F.DLL（非微软真实模块名） |
 | 网卡限制：单网卡 | **已证实**：导入 IPHLPAPI（GetAdaptersInfo）+ `UsedMac`/`RealMac`/`ChoosedNetCard`，MAC 绑定校验 |
-| 动态认证：密钥每秒变化，无法模拟 | **已证伪并实现替代客户端**：认证为 `GET /cgi/client_check?...`（端口 3080 明文 HTTP），`&data=` 为 DES-ECB 密文，**密钥就是同一 URL 里明文传输的 `&time=HH:MM:SS` 参数**。基于此已实现完整替代认证工具 `scripts/glaclient_reimpl.py`（见下文"替代认证客户端"） |
+| 动态认证：密钥每秒变化，无法模拟 | **已证伪并实现替代客户端**：认证为 `GET /cgi/client_check?...`（端口 3080 明文 HTTP），`&data=` 为 DES-ECB 密文，**密钥就是同一 URL 里明文传输的 `&time=HH:MM:SS` 参数**。基于此已实现完整替代认证工具 `analysis/scripts/glaclient_reimpl.py`（见下文"替代认证客户端"） |
 | HTTP 协议（Wireshark 可见） | **已证实**：3080 端口明文 HTTP/1.0，完整请求格式已恢复（见报告第三节） |
 
 ## 关键发现速览
@@ -42,14 +42,15 @@
 
 ```text
 ├── README.md                          # 本文件
-├── gcsetup.exe                        # 样本：安装器（Astrum InstallWizard）
-├── 冰川上网客户端安装目录文件.zip       # 样本：安装目录全套
-├── bcswkhd/                           # 原始样本的另一工作副本（勿改）
-└── cases/bcswkhd-audit/               # 逆向分析案例
+└── analysis/                          # 逆向分析案例（完整）
+    ├── HANDOFF-VM-AGENT.md            # 现场开发交接文档（VM Agent 用）
+    ├── samples/                       # 原始样本（勿执行）
+    │   ├── gcsetup.exe                #   安装器（Astrum InstallWizard）
+    │   └── 冰川上网客户端安装目录文件.zip #   安装目录全套
     ├── reports/README.md              # ★ 完整逆向报告（入口）
     ├── reports/vulnerability-report.md # 正式漏洞报告
     ├── reports/analysis-report.md     # 前期分析报告
-    ├── scripts/                       # 18 个分析/解密脚本（全部可运行）
+    ├── scripts/                       # 22 个分析/解密/工具脚本（全部可运行，路径已便携化）
     │   ├── glaclient_ui.py            # ★★ 图形界面（多账号管理，Windows 支持）
     │   ├── glaclient_reimpl.py        # ★★ 替代认证客户端（登录/保活/登出）
     │   ├── des_data_codec.py          # ★ &data= DES 编解码器（NBS KAT 验证）
@@ -65,30 +66,31 @@
 
 ```bash
 # DES &data= 编解码（抓包 -> 明文）
-python3 cases/bcswkhd-audit/scripts/des_data_codec.py
+python3 analysis/scripts/des_data_codec.py
 # 输出: NBS KAT passed + roundtrip OK（明文格式 ≈ "用户名|密码|主机名"）
 
 # 本地记住密码解密（config.ini -> 明文口令）
-python3 cases/bcswkhd-audit/scripts/keep_password_codec.py
+python3 analysis/scripts/keep_password_codec.py
 ```
 
 ## 替代认证客户端（逆向 reimplementation）
 
-`scripts/glaclient_reimpl.py` 是基于上述逆向结果实现的**完整替代认证工具**，
-可脱离原客户端（无需管理员权限、无需伪装进程、任意网卡环境）完成 Portal 认证：
+`analysis/scripts/glaclient_reimpl.py` 是基于上述逆向结果实现的**完整替代认证工具**，
+可脱离原客户端（无需管理员权限、无需伪装进程、任意网卡环境）完成 Portal 认证
+（以下命令均在仓库根目录执行）：
 
 ```bash
 # 离线自检（验证 DES + 请求构建，不联网）
-python3 glaclient_reimpl.py --selftest
+python3 analysis/scripts/glaclient_reimpl.py --selftest
 
 # 登录
-python3 glaclient_reimpl.py --server 10.10.94.1 --un <用户名> --pwd <密码> login
+python3 analysis/scripts/glaclient_reimpl.py --server 10.10.94.1 --un <用户名> --pwd <密码> login
 
 # 登录 + 自动保活（复刻原客户端状态机：连续 3 次无响应自动重认证）
-python3 glaclient_reimpl.py --server 10.10.94.1 --un <用户名> --pwd <密码> keepalive --interval 20
+python3 analysis/scripts/glaclient_reimpl.py --server 10.10.94.1 --un <用户名> --pwd <密码> keepalive --interval 20
 
 # 登出
-python3 glaclient_reimpl.py --server 10.10.94.1 --un <用户名> --pwd <密码> logoff
+python3 analysis/scripts/glaclient_reimpl.py --server 10.10.94.1 --un <用户名> --pwd <密码> logoff
 ```
 
 与原客户端行为对照：明文结构 `ip|user|pwd|host|0|||MAC|11111111`（0x407310）、
@@ -97,7 +99,7 @@ python3 glaclient_reimpl.py --server 10.10.94.1 --un <用户名> --pwd <密码> 
 
 ## 图形界面版（多账号 + 多虚拟网卡并发 + Windows 支持）
 
-`scripts/glaclient_ui.py` 提供完整 GUI（Python 标准库 tkinter，**零第三方依赖**，
+`analysis/scripts/glaclient_ui.py` 提供完整 GUI（Python 标准库 tkinter，**零第三方依赖**，
 Windows 官方 Python 安装包自带 tkinter）：
 
 - **多账号管理**：增/删/改/保存，列表点选即载入；密码以原客户端 `[KeepPassword]`
@@ -124,16 +126,16 @@ Windows 官方 Python 安装包自带 tkinter）：
   `pyinstaller --onefile --noconsole glaclient_ui.py` 打包成单个 exe
 
 ```bash
-python3 scripts/glaclient_ui.py     # Windows: python glaclient_ui.py
+python3 analysis/scripts/glaclient_ui.py     # Windows: python glaclient_ui.py
 
 # CLI 多账号并发（明文虚拟网卡模式）
-python3 scripts/glaclient_reimpl.py --multi scripts/accounts.json \
+python3 analysis/scripts/glaclient_reimpl.py --multi analysis/scripts/accounts.json \
     --vnic-ip-prefix 10.10.94 --vnic-start 100
 
 # CLI 多账号并发（OS 插卡模式：数据包源 IP = 虚拟 IP，需管理员/root）
 # Windows（管理员）：netsh IP 别名；Linux（sudo）：macvlan 独立 MAC
-python3 scripts/glaclient_reimpl.py --multi scripts/accounts.json --real-vnic
-sudo  python3 scripts/glaclient_reimpl.py --multi scripts/accounts.json --real-vnic
+python3 analysis/scripts/glaclient_reimpl.py --multi analysis/scripts/accounts.json --real-vnic
+sudo  python3 analysis/scripts/glaclient_reimpl.py --multi analysis/scripts/accounts.json --real-vnic
 ```
 
 > 插卡模式说明：Linux macvlan 创建的接口拥有独立 MAC+IP，网关完全将其
